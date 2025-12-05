@@ -1,0 +1,185 @@
+
+name: Dependent Parameters (LOB → Service → Release)
+
+on:
+  workflow_dispatch:
+    inputs:
+      lob:
+        description: "Select LOB (first dropdown)"
+        required: true
+        type: choice
+        options:
+          - CM_CodeDepot
+          - CM_OPT
+          - CM_UHC
+      service:
+        description: "Second param: AUTO or explicit service (depends on LOB)"
+        required: true
+        type: string
+        default: "AUTO"
+      release:
+        description: "Third param: AUTO or explicit release (depends on service)"
+        required: true
+        type: string
+        default: "AUTO"
+      simulate:
+        description: "Use mocked release list for testing"
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  compute-choices:
+    runs-on: ubuntu-latest
+    outputs:
+      services_json:        ${{ steps.derive.outputs.services_json }}
+      releases_json:        ${{ steps.derive.outputs.releases_json }}
+      chosen_service:       ${{ steps.derive.outputs.chosen_service }}
+      chosen_release:       ${{ steps.derive.outputs.chosen_release }}
+    steps:
+      - name: Load config (Managed File equivalent via secret)
+        id: cfg
+        env:
+          CFG_JSON: ${{ secrets.DEPENDENT_CONFIG_JSON }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CFG_JSON:-}" ]]; then
+            echo "ERROR: Missing DEPENDENT_CONFIG_JSON secret" >&2
+            exit 1
+          fi
+          echo "CFG_JSON<<EOF" >> "$GITHUB_ENV"
+          echo "${CFG_JSON}" >> "$GITHUB_ENV"
+          echo "EOF" >> "$GITHUB_ENV"
+
+      - name: Derive services & releases based on inputs (with fail-fast)
+        id: derive
+        env:
+          CFG_JSON: ${{ env.CFG_JSON }}
+          LOB:      ${{ github.event.inputs.lob }}
+          SERVICE_IN: ${{ github.event.inputs.service }}
+          RELEASE_IN: ${{ github.event.inputs.release }}
+          SIMULATE: ${{ github.event.inputs.simulate }}
+          # Optional Artifactory creds if SIMULATE=false:
+          ARTIFACTORY_BASE_URL: ${{ secrets.ARTIFACTORY_BASE_URL }}
+          ARTIFACTORY_ACCESS_TOKEN: ${{ secrets.ARTIFACTORY_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # 1) Compute allowed services for selected LOB
+          exists=$(jq -r --arg lob "${LOB}" '.LOBS | has($lob)' <<< "${CFG_JSON}")
+          if [[ "${exists}" != "true" ]]; then
+            echo "::error::LOB '${LOB}' not found in config"
+            exit 2
+          fi
+
+          services_json=$(jq -c --arg lob "${LOB}" '.LOBS[$lob]' <<< "${CFG_JSON}")
+          printf "services_json<<EOF\n%s\nEOF\n" "${services_json}" >> "$GITHUB_OUTPUT"
+
+          # Decide chosen service: explicit vs AUTO
+          chosen_service="${SERVICE_IN}"
+          if [[ "${SERVICE_IN}" == "AUTO" ]]; then
+            chosen_service=$(echo "${services_json}" | jq -r '.[0]')
+            if [[ -z "${chosen_service}" || "${chosen_service}" == "null" ]]; then
+              echo "::error::No services available for LOB '${LOB}'"
+              exit 3
+            fi
+          else
+            # Validate explicit service against allowed list
+            allowed=$(echo "${services_json}" | jq -r '.[]')
+            match="false"
+            while read -r s; do
+              [[ "${s}" == "${SERVICE_IN}" ]] && match="true" && break
+            done <<< "${allowed}"
+            if [[ "${match}" != "true" ]]; then
+              echo "::error::Service '${SERVICE_IN}' is not valid for LOB '${LOB}'. Allowed: $(echo "${services_json}" | jq -r '.[]' | paste -sd ', ' -)"
+              exit 4
+            fi
+          fi
+
+          echo "chosen_service=${chosen_service}" >> "$GITHUB_OUTPUT"
+
+          # 2) Compute releases for chosen service
+          # Config provides an artifact path for each service (or other metadata)
+          service_exists=$(jq -r --arg svc "${chosen_service}" '.SERVICES | has($svc)' <<< "${CFG_JSON}")
+          if [[ "${service_exists}" != "true" ]]; then
+            echo "::error::Service '${chosen_service}' missing in SERVICES map"
+            exit 5
+          fi
+
+          artifact_path=$(jq -r --arg svc "${chosen_service}" '.SERVICES[$svc].artifact_path' <<< "${CFG_JSON}")
+          if [[ -z "${artifact_path}" || "${artifact_path}" == "null" ]]; then
+            echo "::error::No artifact_path configured for service '${chosen_service}'"
+            exit 6
+          fi
+
+          # Simulate or query Artifactory to get releases
+          if [[ "${SIMULATE}" == "true" ]]; then
+            # Simulated release list
+            releases_json='["'${chosen_service}'_v20251201","'${chosen_service}'_v20251202_hotfix","'${chosen_service}'_v20251129"]'
+          else
+            # Real call (example using Storage API listing); expects .files[].uri zip names
+            if [[ -z "${ARTIFACTORY_BASE_URL:-}" || -z "${ARTIFACTORY_ACCESS_TOKEN:-}" ]]; then
+              echo "::error::Missing ARTIFACTORY_BASE_URL/ACCESS_TOKEN secrets"
+              exit 7
+            fi
+            list_url="${ARTIFACTORY_BASE_URL%/}/api/storage/${artifact_path}?list&deep=0"
+            http_code=$(curl -sS -H "Authorization: Bearer ${ARTIFACTORY_ACCESS_TOKEN}" -o response.json -w "%{http_code}" "${list_url}")
+            if [[ "${http_code}" -lt 200 || "${http_code}" -ge 300 ]]; then
+              echo "::error::Artifactory listing failed HTTP ${http_code}"
+              cat response.json >&2 || true
+              exit 8
+            fi
+            # Extract names; strip leading / and .zip (if relevant), produce JSON array
+            releases_json=$(jq -c '[.files[]?.uri | ltrimstr("/") | sub("\\.zip$"; "")]' response.json)
+          fi
+
+          printf "releases_json<<EOF\n%s\nEOF\n" "${releases_json}" >> "$GITHUB_OUTPUT"
+
+          # Decide chosen release: explicit vs AUTO
+          chosen_release="${RELEASE_IN}"
+          if [[ "${RELEASE_IN}" == "AUTO" ]]; then
+            chosen_release=$(echo "${releases_json}" | jq -r '.[0]')
+            if [[ -z "${chosen_release}" || "${chosen_release}" == "null" ]]; then
+              echo "::error::No releases available for service '${chosen_service}'"
+              exit 9
+            fi
+          else
+            # Validate explicit release
+            match=$(echo "${releases_json}" | jq -r --arg rel "${RELEASE_IN}" 'map(select(. == $rel)) | length')
+            if [[ "${match}" -eq 0 ]]; then
+              echo "::error::Release '${RELEASE_IN}' is not valid for service '${chosen_service}'. Allowed: $(echo "${releases_json}" | jq -r '.[]' | paste -sd ', ' -)"
+              exit 10
+            fi
+          fi
+
+          echo "chosen_release=${chosen_release}" >> "$GITHUB_OUTPUT"
+
+          # Summarize for the run
+          {
+            echo "### Dependent selections"
+            echo
+            echo "**LOB:** \`${LOB}\`"
+            echo "**Service (computed):** \`${chosen_service}\`"
+            echo "**Release (computed):** \`${chosen_release}\`"
+            echo
+            echo "**Allowed services for LOB \`${LOB}\`:**"
+            echo
+            echo "$(echo "${services_json}" | jq -r '.[]' | sed 's/^/- /')"
+            echo
+            echo "**Available releases for service \`${chosen_service}\`:**"
+            echo
+            echo "$(echo "${releases_json}" | jq -r '.[]' | sed 's/^/- /')"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    needs: compute-choices
+    runs-on: ubuntu-latest
+    steps:
+      - name: Show final values
+        run: |
+          echo "LOB:      ${{ github.event.inputs.lob }}"
+          echo "Service:  ${{ needs.compute-choices.outputs.chosen_service }}"
+          echo "Release:  ${{ needs.compute-choices.outputs.chosen_release }}"
+
+      # Real deploy would go here:
+      # - run: ./deploy.sh "${{ github.event.inputs.lob }}" "${{ needs.compute-choices.outputs.chosen_service }}" "${{ needs.compute-choices.outputs.chosen_release }}"
